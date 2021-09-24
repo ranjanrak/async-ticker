@@ -1,20 +1,61 @@
 import six
 import asyncio
 import struct
-import json, logging
+import json
 
 from autobahn.asyncio.websocket import WebSocketClientProtocol, \
     WebSocketClientFactory
 
-logging.basicConfig(level=logging.DEBUG)
-
-# Kite connect API credentials
-api_key = 'your_api_key'
-access_token = 'your_access_token'
-
 class TickerClientProtocol(WebSocketClientProtocol):
-    """ Kite ticker autobahn WebSocket protocol """
+    """ Kite ticker autobahn WebSocket base protocol """
 
+    def onConnect(self, response):
+        """
+        Called when WebSocket server connection is established successfully
+        """
+        self.factory.ws = self
+        self.factory.on_connect(self, response)
+
+    def onOpen(self):
+        """
+        Called when the initial WebSocket opening handshake was completed
+        """
+        print("WebSocket connection open.")
+
+    def onMessage(self, payload, isBinary):
+        """
+        Called when text or payload is received.
+        """
+        if self.factory.on_message:
+            self.factory.on_message(self, payload, isBinary)
+
+    def onClose(self, wasClean, code, reason):
+        """
+        Called when connection is closed
+        """
+        print("WebSocket connection closed: {0}".format(reason))
+
+
+class TickerClientFactory(WebSocketClientFactory):
+    """
+    Implement custom call backs for WebSocketClientFactory
+    """
+
+    def __init__(self, *args, **kwargs):
+        """
+        Initialize with callback methods
+        """
+        self.ws = None
+        self.on_message = None
+        self.on_connect = None
+
+        super(TickerClientFactory, self).__init__(*args, **kwargs)
+
+class MainTicker():
+    """
+    Main Ticker client
+    """
+    # Exchange map for ticker
     EXCHANGE_MAP = {
         "nse": 1,
         "nfo": 2,
@@ -32,26 +73,71 @@ class TickerClientProtocol(WebSocketClientProtocol):
     MODE_QUOTE = "quote"
     MODE_LTP = "ltp"
 
-    def subscribe(self, tokenList):
-        # Subscribe to required list of tokens
-        self.sendMessage(six.b(json.dumps({"a": "subscribe", "v": tokenList})))
-        self.sendMessage(six.b(json.dumps({"a": "mode", "v": ["ltp", tokenList]})))
+    def __init__(self, api_key, access_token):
+        """
+        Initialise websocket client
+        """
+        self.ws_url = "wss://ws.kite.trade?api_key={}&access_token={}".format(api_key, access_token)
 
-    def onConnect(self, response):
-        # Subscribe to required list of tokens
-        self.subscribe([408065, 884737])
+        # Placeholders for callbacks.
+        self.on_ticks = None
+        self.on_connect = None
+        self.on_message = None
 
-    def onOpen(self):
-        print("WebSocket connection open.")
+    def connect_ws(self):
+        """
+        Establish ws connection
+        """
+        self.factory = TickerClientFactory(self.ws_url)
+        self.factory.protocol = TickerClientProtocol
 
-    def onMessage(self, payload, isBinary):
-        print(self._parse_binary(payload))
+        self.ws = self.factory.ws
 
-    def onClose(self, wasClean, code, reason):
-        print("WebSocket connection closed: {0}".format(reason))
+        # Register private callback
+        self.factory.on_connect = self._on_connect
+        self.factory.on_message = self._on_message
+
+        # Run an infinite loop using asyncio
+        loop = asyncio.get_event_loop()
+        coro = loop.create_connection(self.factory, "ws.kite.trade", 443, ssl=True)
+        loop.run_until_complete(coro)
+        loop.run_forever()
+
+    def _on_connect(self, ws, response):
+        """ 
+        proxy for on_connect 
+        """
+        self.ws = ws
+        if self.on_connect:
+            self.on_connect(self, response)
+
+    def subscribe(self, token_list):
+        """
+        Subscribe to required list of tokens
+        """
+        self.ws.sendMessage(six.b(json.dumps({"a": "subscribe", "v": token_list})))
+
+    def set_mode(self, mode, token_list):
+        """
+        Set streaming mode for the given list of tokens
+        """
+        self.ws.sendMessage(six.b(json.dumps({"a": "mode", "v": [mode, token_list]})))
+
+    def _on_message(self, ws, payload, isBinary):
+        """
+        proxy for on_message
+        """
+        if self.on_message:
+            self.on_message(self, payload, isBinary)
+
+        # If the message is binary, parse it and send it to the callback.
+        if self.on_ticks and isBinary and len(payload) > 4:
+            self.on_ticks(self, self._parse_binary(payload))
 
     def _parse_binary(self, bin):
-        """Parse binary data to a (list of) ticks structure."""
+        """
+        Parse binary data to a (list of) ticks structure.
+        """
         packets = self._split_packets(bin)  # split data to individual ticks packet
         data = []
 
@@ -189,15 +275,3 @@ class TickerClientProtocol(WebSocketClientProtocol):
             j = j + 2 + packet_length
 
         return packets
-
-
-if __name__ == '__main__':
-    # WebSocket endpoint
-    ws_url = "wss://ws.kite.trade?api_key={}&access_token={}".format(api_key, access_token)
-    factory = WebSocketClientFactory(ws_url)
-    factory.protocol = TickerClientProtocol
-
-    loop = asyncio.get_event_loop()
-    coro = loop.create_connection(factory, "ws.kite.trade", 443, ssl=True)
-    loop.run_until_complete(coro)
-    loop.run_forever()
