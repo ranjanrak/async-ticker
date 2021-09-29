@@ -145,7 +145,14 @@ class MainTicker():
             instrument_token = self._unpack_int(packet, 0, 4)
             segment = instrument_token & 0xff  # Retrive segment constant from instrument_token
 
-            divisor = 10000000.0 if segment == self.EXCHANGE_MAP["cds"] else 100.0
+            # Add price divisor based on segment
+            # This factor converts paisa to rupees
+            if segment == self.EXCHANGE_MAP["cds"]:
+                divisor = 10000000.0
+            elif segment == self.EXCHANGE_MAP["bsecds"]:
+                divisor = 10000.0
+            else:
+                divisor = 100.0
 
             # All indices are not tradable
             tradable = False if segment == self.EXCHANGE_MAP["indices"] else True
