@@ -3,55 +3,72 @@ import asyncio
 import struct
 import json
 
-from autobahn.asyncio.websocket import WebSocketClientProtocol, \
-    WebSocketClientFactory
+class TickerClientProtocol(asyncio.Protocol):
+    """ Kite ticker asyncio WebSocket base protocol """
 
-class TickerClientProtocol(WebSocketClientProtocol):
-    """ Kite ticker autobahn WebSocket base protocol """
-
-    def onConnect(self, response):
+    def connection_made(self, transport):
         """
         Called when WebSocket server connection is established successfully
         """
+        self.transport = transport
         self.factory.ws = self
-        self.factory.on_connect(self, response)
+        self.factory.on_connect(self)
 
-    def onOpen(self):
+    def data_received(self, data):
         """
-        Called when the initial WebSocket opening handshake was completed
+        Called when data is received
         """
-        print("WebSocket connection open.")
+        self.factory.on_message(self, data)
 
-    def onMessage(self, payload, isBinary):
-        """
-        Called when text or payload is received.
-        """
-        if self.factory.on_message:
-            self.factory.on_message(self, payload, isBinary)
-
-    def onClose(self, wasClean, code, reason):
+    def connection_lost(self, exc):
         """
         Called when connection is closed
         """
-        print("WebSocket connection closed: {0}".format(reason))
+        self.factory.on_close(self)
 
+    def send_message(self, message):
+        """
+        Send message to WebSocket server
+        """
+        self.transport.write(message)
 
-class TickerClientFactory(WebSocketClientFactory):
+class TickerClientFactory:
     """
-    Implement custom call backs for WebSocketClientFactory
+    Implement custom callbacks for WebSocketClientFactory
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, ws_url, on_connect=None, on_message=None, on_close=None):
         """
         Initialize with callback methods
         """
+        self.ws_url = ws_url
+        self.on_connect = on_connect
+        self.on_message = on_message
+        self.on_close = on_close
         self.ws = None
-        self.on_message = None
-        self.on_connect = None
 
-        super(TickerClientFactory, self).__init__(*args, **kwargs)
+    async def connect_ws(self):
+        """
+        Establish ws connection
+        """
+        loop = asyncio.get_running_loop()
+        self.ws = await loop.create_connection(lambda: TickerClientProtocol(), self.ws_url, 443, ssl=True)
 
-class MainTicker():
+    def send_message(self, message):
+        """
+        Send message to WebSocket server
+        """
+        if self.ws:
+            self.ws[0].send_message(message)
+
+    def close_ws(self):
+        """
+        Close WebSocket connection
+        """
+        if self.ws:
+            self.ws[0].transport.close()
+
+class MainTicker:
     """
     Main Ticker client
     """
@@ -77,73 +94,77 @@ class MainTicker():
         """
         Initialise websocket client
         """
-        self.ws_url = "wss://ws.kite.trade?api_key={}&access_token={}".format(api_key, access_token)
+        self.ws_url = f"wss://ws.kite.trade?api_key={api_key}&access_token={access_token}"
 
         # Placeholders for callbacks.
         self.on_ticks = None
         self.on_connect = None
         self.on_message = None
+        self.factory = None
 
-    def connect_ws(self):
+    async def connect_ws(self):
         """
         Establish ws connection
         """
-        self.factory = TickerClientFactory(self.ws_url)
-        self.factory.protocol = TickerClientProtocol
+        self.factory = TickerClientFactory(self.ws_url, on_connect=self._on_connect, on_message=self._on_message, on_close=self._on_close)
+        await self.factory.connect_ws()
 
-        self.ws = self.factory.ws
-
-        # Register private callback
-        self.factory.on_connect = self._on_connect
-        self.factory.on_message = self._on_message
-
-        # Run an infinite loop using asyncio
-        loop = asyncio.get_event_loop()
-        coro = loop.create_connection(self.factory, "ws.kite.trade", 443, ssl=True)
-        loop.run_until_complete(coro)
-        loop.run_forever()
-
-    def _on_connect(self, ws, response):
-        """ 
-        proxy for on_connect 
+    def _on_connect(self, protocol):
         """
-        self.ws = ws
+        Proxy for on_connect
+        """
         if self.on_connect:
-            self.on_connect(self, response)
+            self.on_connect(self)
+
+    def _on_message(self, protocol, data):
+        """
+        Proxy for on_message
+        """
+        if self.on_message:
+            self.on_message(self, data)
+
+        # If the message is binary, parse it and send it to the callback.
+        if self.on_ticks and len(data) > 4:
+            self.on_ticks(self, self._parse_binary(data))
+
+    def _on_close(self, protocol):
+        """
+        Proxy for on_close
+        """
+        if self.on_close:
+            self.on_close(self)
 
     def subscribe(self, token_list):
         """
-        Subscribe to required list of tokens
+        Subscribe to the required list of tokens
         """
-        self.ws.sendMessage(six.b(json.dumps({"a": "subscribe", "v": token_list})))
+        message = six.b(json.dumps({"a": "subscribe", "v": token_list}))
+        self.factory.send_message(message)
+
+    def unsubscribe(self, token_list):
+        """
+        Unsubscribe from the required list of tokens
+        """
+        message = six.b(json.dumps({"a": "unsubscribe", "v": token_list}))
+        self.factory.send_message(message)
 
     def set_mode(self, mode, token_list):
         """
-        Set streaming mode for the given list of tokens
+        Set mode for the required list of tokens
         """
-        self.ws.sendMessage(six.b(json.dumps({"a": "mode", "v": [mode, token_list]})))
-
-    def _on_message(self, ws, payload, isBinary):
-        """
-        proxy for on_message
-        """
-        if self.on_message:
-            self.on_message(self, payload, isBinary)
-
-        # If the message is binary, parse it and send it to the callback.
-        if self.on_ticks and isBinary and len(payload) > 4:
-            self.on_ticks(self, self._parse_binary(payload))
+        message = six.b(json.dumps({"a": "mode", "v": [mode, token_list]}))
+        self.factory.send_message(message)
 
     def _parse_binary(self, bin):
         """
         Parse binary data to a (list of) ticks structure.
         """
-        packets = self._split_packets(bin)  # split data to individual ticks packet
+        packets = self._split_packets(bin)  # split data into individual ticks packets
         data = []
 
         for packet in packets:
             instrument_token = self._unpack_int(packet, 0, 4)
-            segment = instrument_token & 0xff  # Retrive segment constant from instrument_token
+            segment = instrument_token & 0xff  # Retrieve segment constant from instrument_token
 
             # Add price divisor based on segment
             # This factor converts paisa to rupees
@@ -184,7 +205,7 @@ class MainTicker():
 
                 # Compute the change price using close price and last price
                 d["change"] = 0
-                if(d["ohlc"]["close"] != 0):
+                if d["ohlc"]["close"] != 0:
                     d["change"] = (d["last_price"] - d["ohlc"]["close"]) * 100 / d["ohlc"]["close"]
 
                 # Full mode with timestamp
@@ -221,7 +242,7 @@ class MainTicker():
 
                 # Compute the change price using close price and last price
                 d["change"] = 0
-                if(d["ohlc"]["close"] != 0):
+                if d["ohlc"]["close"] != 0:
                     d["change"] = (d["last_price"] - d["ohlc"]["close"]) * 100 / d["ohlc"]["close"]
 
                 # Parse full mode
@@ -263,11 +284,11 @@ class MainTicker():
         return data
 
     def _unpack_int(self, bin, start, end, byte_format="I"):
-        """Unpack binary data as unsgined interger."""
+        """Unpack binary data as unsigned integer."""
         return struct.unpack(">" + byte_format, bin[start:end])[0]
 
     def _split_packets(self, bin):
-        """Split the data to individual packets of ticks."""
+        """Split the data into individual packets of ticks."""
         # Ignore heartbeat data.
         if len(bin) < 2:
             return []
